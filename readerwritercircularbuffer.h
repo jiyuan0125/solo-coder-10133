@@ -38,15 +38,9 @@ public:
 		nextSlot(0), nextItem(0)
 	{
 		// Round capacity up to power of two to compute modulo mask.
-		// Adapted from http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
-		--capacity;
-		capacity |= capacity >> 1;
-		capacity |= capacity >> 2;
-		capacity |= capacity >> 4;
-		for (std::size_t i = 1; i < sizeof(std::size_t); i <<= 1)
-			capacity |= capacity >> (i << 3);
-		mask = capacity++;
-		rawData = static_cast<char*>(std::malloc(capacity * sizeof(T) + std::alignment_of<T>::value - 1));
+		std::size_t roundedCap = ::moodycamel::ceilToPow2(capacity);
+		mask = roundedCap - 1;
+		rawData = static_cast<char*>(std::malloc(roundedCap * sizeof(T) + std::alignment_of<T>::value - 1));
 		data = align_for<T>(rawData);
 	}
 

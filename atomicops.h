@@ -351,6 +351,20 @@ private:
 #endif
 };
 
+	AE_FORCEINLINE std::size_t ceilToPow2(std::size_t x)
+	{
+		// From http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
+		--x;
+		x |= x >> 1;
+		x |= x >> 2;
+		x |= x >> 4;
+		for (std::size_t i = 1; i < sizeof(std::size_t); i <<= 1) {
+			x |= x >> (i << 3);
+		}
+		++x;
+		return x;
+	}
+
 }	// end namespace moodycamel
 
 
