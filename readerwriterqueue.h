@@ -31,6 +31,16 @@
 // Switching roles of the threads, or using multiple consecutive threads for
 // one role, is not safe unless properly synchronized.
 // Using the queue exclusively from one thread is fine, though a bit silly.
+//
+// Template parameters:
+//   - T:              The type of elements stored in the queue.
+//   - MAX_BLOCK_SIZE: The maximum capacity (must be a compile-time power of 2
+//                     and >= 2) of any individual internal block. The
+//                     largest actual per-block capacity is clamped to this value.
+//                     If the requested `size` passed to the constructor is
+//                     large enough to require more than one block, all blocks
+//                     will have exactly MAX_BLOCK_SIZE capacity regardless of how
+//                     much larger `size` is.
 
 #ifndef MOODYCAMEL_CACHE_LINE_SIZE
 #define MOODYCAMEL_CACHE_LINE_SIZE 64
@@ -725,7 +735,16 @@ private:
 #endif
 };
 
-// Like ReaderWriterQueue, but also providees blocking operations
+// Like ReaderWriterQueue, but also provides blocking operations.
+//
+// Template parameters:
+//   - T:              The type of elements stored in the queue.
+//   - MAX_BLOCK_SIZE: The maximum capacity (power of 2, >= 2) of any individual
+//                     internal block. When the preallocated blocks are exhausted,
+//                     new blocks are created with capacity up to MAX_BLOCK_SIZE.
+//                     The actual per-block capacity used at construction may be
+//                     smaller, but will never exceed this value regardless of the
+//                     requested queue size.
 template<typename T, size_t MAX_BLOCK_SIZE = 512>
 class BlockingReaderWriterQueue
 {
@@ -733,6 +752,9 @@ private:
 	typedef ::moodycamel::ReaderWriterQueue<T, MAX_BLOCK_SIZE> ReaderWriterQueue;
 	
 public:
+	// Constructs a blocking queue that can hold at least `size` elements
+	// without further allocations. See ReaderWriterQueue's constructor for
+	// details on how blocks are sized and allocated.
 	explicit BlockingReaderWriterQueue(size_t size = 15) AE_NO_TSAN
 		: inner(size), sema(new spsc_sema::LightweightSemaphore())
 	{ }
