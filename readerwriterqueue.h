@@ -102,6 +102,18 @@ public:
 	// allocations. If more than MAX_BLOCK_SIZE elements are requested,
 	// then several blocks of MAX_BLOCK_SIZE each are reserved (including
 	// at least one extra buffer block).
+	//
+	// NOTE ON MAX_BLOCK_SIZE CLAMPING:
+	// When the requested `size` is large enough that `ceilToPow2(size + 1)`
+	// exceeds `MAX_BLOCK_SIZE * 2`, `largestBlockSize` is clamped to
+	// `MAX_BLOCK_SIZE`. All subsequent block allocations (when the queue grows
+	// beyond initial capacity) will also use `MAX_BLOCK_SIZE` as their fixed
+	// size -- blocks will NOT grow beyond `MAX_BLOCK_SIZE` regardless of how
+	// many elements are enqueued. This means passing a very large `size` (e.g.,
+	// an astronomical number) will still result in blocks of `MAX_BLOCK_SIZE`
+	// each; the queue will pre-allocate enough such blocks to satisfy the
+	// requested initial capacity, but future growth will continue in
+	// `MAX_BLOCK_SIZE` increments.
 	AE_NO_TSAN explicit ReaderWriterQueue(size_t size = 15)
 #ifndef NDEBUG
 		: enqueuing(false)
@@ -256,6 +268,9 @@ public:
 	// Enqueues a copy of element on the queue.
 	// Allocates an additional block of memory if needed.
 	// Only fails (returns false) if memory allocation fails.
+	//
+	// EXCEPTION SAFETY NOTE: See emplace() for details on exception handling
+	// exception behavior when T's constructor throws.
 	AE_FORCEINLINE bool enqueue(T const& element) AE_NO_TSAN
 	{
 		return inner_enqueue<CanAlloc>(element);
@@ -271,6 +286,20 @@ public:
 
 #if MOODYCAMEL_HAS_EMPLACE
 	// Like enqueue() but with emplace semantics (i.e. construct-in-place).
+	//
+	// EXCEPTION SAFETY NOTE (applies to enqueue(), emplace(), and try_emplace()):
+	// If T's constructor throws an exception during element construction:
+	// - If the exception occurs while writing to the current block or an existing
+	//   next block: no memory is leaked, the tail pointer is not advanced, and
+	//   size_approx() will not report a phantom element. The queue remains in a
+	//   valid state and can continue to be used.
+	// - If the exception occurs while writing to a newly allocated block (CanAlloc
+	//   path only): the newly allocated block is freed, largestBlockSize is rolled
+	//   back, and no invariants are broken. The exception is rethrown to the caller.
+	// - However, if the exception propagates through BlockingReaderWriterQueue's
+	//   wrapper layer, the semaphore will NOT have been signaled (since enqueue()
+	//   returns false or throws before reaching sema->signal()). This maintains
+	//   consistency between the semaphore count and the actual element count.
 	template<typename... Args>
 	AE_FORCEINLINE bool emplace(Args&&... args) AE_NO_TSAN
 	{
@@ -514,6 +543,15 @@ public:
 	//       the block the consumer is removing from until it's completely empty, except in
 	//       the case where the producer was writing to the same block the consumer was
 	//       reading from the whole time.
+	//
+	// NOTE ON MAX_BLOCK_SIZE CLAMPING:
+	// This value reflects the sum of `sizeMask` across all currently allocated blocks.
+	// If the queue was constructed with a `size` large enough to trigger clamping to
+	// `MAX_BLOCK_SIZE` (see constructor documentation), this value will account for
+	// all initially allocated blocks. When the queue grows beyond initial capacity,
+	// new blocks of `MAX_BLOCK_SIZE` are added, and this value will increase by
+	// `MAX_BLOCK_SIZE - 1` per new block (accounting for the one-element waste per
+	// block to distinguish "empty" from "full").
 	inline size_t max_capacity() const {
 		size_t result = 0;
 		Block* frontBlock_ = frontBlock.load();
@@ -578,27 +616,28 @@ private:
 				fence(memory_order_acquire);		// Ensure we get latest writes if we got the latest frontBlock
 
 				// tailBlock is full, but there's a free block ahead, use it
-				Block* tailBlockNext = tailBlock_->next.load();
-				size_t nextBlockFront = tailBlockNext->localFront = tailBlockNext->front.load();
-				nextBlockTail = tailBlockNext->tail.load();
-				fence(memory_order_acquire);
+			Block* tailBlockNext = tailBlock_->next.load();
+			size_t nextBlockFront = tailBlockNext->localFront = tailBlockNext->front.load();
+			nextBlockTail = tailBlockNext->tail.load();
+			fence(memory_order_acquire);
 
-				// This block must be empty since it's not the head block and we
-				// go through the blocks in a circle
-				assert(nextBlockFront == nextBlockTail);
-				tailBlockNext->localFront = nextBlockFront;
+			// This block must be empty since it's not the head block and we
+			// go through the blocks in a circle
+			assert(nextBlockFront == nextBlockTail);
+			tailBlockNext->localFront = nextBlockFront;
 
-				char* location = tailBlockNext->data + nextBlockTail * sizeof(T);
+			char* location = tailBlockNext->data + nextBlockTail * sizeof(T);
 #if MOODYCAMEL_HAS_EMPLACE
-				new (location) T(std::forward<Args>(args)...);
+			new (location) T(std::forward<Args>(args)...);
 #else
-				new (location) T(std::forward<U>(element));
+			new (location) T(std::forward<U>(element));
 #endif
 
-				tailBlockNext->tail = (nextBlockTail + 1) & tailBlockNext->sizeMask;
+			fence(memory_order_release);
+			tailBlockNext->tail = (nextBlockTail + 1) & tailBlockNext->sizeMask;
 
-				fence(memory_order_release);
-				tailBlock = tailBlockNext;
+			fence(memory_order_release);
+			tailBlock = tailBlockNext;
 			}
 			else if (canAlloc == CanAlloc) {
 				// tailBlock is full and there's no free block ahead; create a new block
@@ -608,14 +647,32 @@ private:
 					// Could not allocate a block!
 					return false;
 				}
+				auto originalLargestBlockSize = largestBlockSize;
 				largestBlockSize = newBlockSize;
 
+#ifdef MOODYCAMEL_EXCEPTIONS_ENABLED
+				try {
+#endif
 #if MOODYCAMEL_HAS_EMPLACE
 				new (newBlock->data) T(std::forward<Args>(args)...);
 #else
 				new (newBlock->data) T(std::forward<U>(element));
 #endif
+#ifdef MOODYCAMEL_EXCEPTIONS_ENABLED
+				} catch (...) {
+					// Rollback: free the newly allocated block and restore largestBlockSize
+					// to prevent invariant corruption. The element was never published,
+					// so size_approx will not report a phantom element.
+					auto rawBlock = newBlock->rawThis;
+					newBlock->~Block();
+					std::free(rawBlock);
+					largestBlockSize = originalLargestBlockSize;
+					throw;
+				}
+#endif
 				assert(newBlock->front == 0);
+
+				fence(memory_order_release);
 				newBlock->tail = newBlock->localTail = 1;
 
 				newBlock->next = tailBlock_->next.load();
@@ -653,6 +710,9 @@ private:
 
 	AE_FORCEINLINE static size_t ceilToPow2(size_t x)
 	{
+		if (x <= 1) {
+			return 1;
+		}
 		// From http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
 		--x;
 		x |= x >> 1;
@@ -762,6 +822,9 @@ private:
 	typedef ::moodycamel::ReaderWriterQueue<T, MAX_BLOCK_SIZE> ReaderWriterQueue;
 	
 public:
+	// Constructs a blocking queue that can hold at least `size` elements without further
+	// allocations. See ReaderWriterQueue::ReaderWriterQueue for details on MAX_BLOCK_SIZE
+	// clamping behavior when `size` is large.
 	explicit BlockingReaderWriterQueue(size_t size = 15) AE_NO_TSAN
 		: inner(size), sema(new spsc_sema::LightweightSemaphore())
 	{ }
@@ -842,6 +905,13 @@ public:
 
 #if MOODYCAMEL_HAS_EMPLACE
 	// Like enqueue() but with emplace semantics (i.e. construct-in-place).
+	//
+	// EXCEPTION SAFETY NOTE: If T's constructor throws during inner.emplace(),
+	// the exception propagates through this wrapper. The semaphore is NOT signaled
+	// AFTER inner.emplace() returns successfully, so if an exception is thrown,
+	// the semaphore count remains consistent with the actual element count
+	// (no phantom elements visible via size_approx()).
+	// See ReaderWriterQueue::emplace() for full exception safety details.
 	template<typename... Args>
 	AE_FORCEINLINE bool emplace(Args&&... args) AE_NO_TSAN
 	{
@@ -946,7 +1016,7 @@ public:
 	// Safe to call from both the producer and consumer threads.
 	AE_FORCEINLINE size_t size_approx() const AE_NO_TSAN
 	{
-		return sema->availableApprox();
+		return inner.size_approx();
 	}
 
 	// Returns the total number of items that could be enqueued without incurring

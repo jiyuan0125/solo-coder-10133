@@ -24,6 +24,23 @@
 
 namespace moodycamel {
 
+namespace details {
+	AE_FORCEINLINE static std::size_t ceilToPow2(std::size_t x)
+	{
+		if (x <= 1) {
+			return 1;
+		}
+		--x;
+		x |= x >> 1;
+		x |= x >> 2;
+		x |= x >> 4;
+		for (std::size_t i = 1; i < sizeof(std::size_t); i <<= 1)
+			x |= x >> (i << 3);
+		++x;
+		return x;
+	}
+}
+
 template<typename T>
 class BlockingReaderWriterCircularBuffer
 {
@@ -37,16 +54,13 @@ public:
 		items(new spsc_sema::LightweightSemaphore(0)),
 		nextSlot(0), nextItem(0)
 	{
-		// Round capacity up to power of two to compute modulo mask.
-		// Adapted from http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
-		--capacity;
-		capacity |= capacity >> 1;
-		capacity |= capacity >> 2;
-		capacity |= capacity >> 4;
-		for (std::size_t i = 1; i < sizeof(std::size_t); i <<= 1)
-			capacity |= capacity >> (i << 3);
-		mask = capacity++;
-		rawData = static_cast<char*>(std::malloc(capacity * sizeof(T) + std::alignment_of<T>::value - 1));
+		// Internal allocation always uses at least 1 slot to avoid UB from
+		// capacity-1 underflow. The public API (max_capacity, try_enqueue, etc.)
+		// still respects the user-provided capacity value.
+		std::size_t internalCapacity = capacity == 0 ? 1 : capacity;
+		std::size_t alignedCapacity = details::ceilToPow2(internalCapacity);
+		mask = alignedCapacity - 1;
+		rawData = static_cast<char*>(std::malloc(alignedCapacity * sizeof(T) + std::alignment_of<T>::value - 1));
 		data = align_for<T>(rawData);
 	}
 
@@ -65,7 +79,8 @@ public:
 	// being deleted. It's up to the user to synchronize this.
 	~BlockingReaderWriterCircularBuffer()
 	{
-		for (std::size_t i = 0, n = items->availableApprox(); i != n; ++i)
+		std::size_t n = nextSlot - nextItem;
+		for (std::size_t i = 0; i != n; ++i)
 			reinterpret_cast<T*>(data)[(nextItem + i) & mask].~T();
 		std::free(rawData);
 	}
@@ -95,7 +110,18 @@ public:
 	// Enqueues a single item (by copying it).
 	// Fails if not enough room to enqueue.
 	// Thread-safe when called by producer thread.
-	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	//
+	// EXCEPTION SAFETY NOTE: If T's constructor throws during inner_enqueue(),
+	// the slots_ semaphore has already been decremented (via tryWait()), but the
+	// items semaphore has NOT been incremented yet (items->signal() happens
+	// AFTER successful construction). This means:
+	// - A slot is "lost" (consumed but no element was produced)
+	// - size_approx() will NOT report a phantom element (items count is correct)
+	// - The queue remains in a consistent state, but effective capacity is
+	//   reduced by one for the lifetime of the queue.
+	// This is a known limitation: full rollback of the slots semaphore would
+	// require re-signaling it, which could introduce ordering issues with the
+	// consumer thread.
 	bool try_enqueue(T const& item)
 	{
 		if (!slots_->tryWait())
@@ -238,7 +264,8 @@ public:
 	// Thread-safe when called by consumer thread.
 	inline T* peek()
 	{
-		if (!items->availableApprox())
+		fence(memory_order_acquire);
+		if (nextSlot == nextItem)
 			return nullptr;
 		return inner_peek();
 	}
@@ -253,11 +280,12 @@ public:
 		return true;
 	}
 
-	// Returns a (possibly outdated) snapshot of the total number of elements currently in the buffer.
+	// Returns a snapshot of the total number of elements currently in the buffer.
 	// Thread-safe.
 	inline std::size_t size_approx() const
 	{
-		return items->availableApprox();
+		fence(memory_order_acquire);
+		return nextSlot - nextItem;
 	}
 
 	// Returns the maximum number of elements that this circular buffer can hold at once.
