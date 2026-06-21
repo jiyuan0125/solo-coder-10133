@@ -1,8 +1,0 @@
-/home/baru/sc-workspace/10133_20260621220249/10133_20260621220249_cameron314_readerwriterqueue/build/CMakeFiles/package.dir
-/home/baru/sc-workspace/10133_20260621220249/10133_20260621220249_cameron314_readerwriterqueue/build/CMakeFiles/package_source.dir
-/home/baru/sc-workspace/10133_20260621220249/10133_20260621220249_cameron314_readerwriterqueue/build/CMakeFiles/edit_cache.dir
-/home/baru/sc-workspace/10133_20260621220249/10133_20260621220249_cameron314_readerwriterqueue/build/CMakeFiles/rebuild_cache.dir
-/home/baru/sc-workspace/10133_20260621220249/10133_20260621220249_cameron314_readerwriterqueue/build/CMakeFiles/list_install_components.dir
-/home/baru/sc-workspace/10133_20260621220249/10133_20260621220249_cameron314_readerwriterqueue/build/CMakeFiles/install.dir
-/home/baru/sc-workspace/10133_20260621220249/10133_20260621220249_cameron314_readerwriterqueue/build/CMakeFiles/install/local.dir
-/home/baru/sc-workspace/10133_20260621220249/10133_20260621220249_cameron314_readerwriterqueue/build/CMakeFiles/install/strip.dir

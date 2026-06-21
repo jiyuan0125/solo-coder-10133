@@ -333,16 +333,20 @@ public:
 		// where we have the fast path if the front block is not empty, then read the tail block,
 		// then re-read the front block and check if it's not empty again, then check if the tail
 		// block has advanced.
-		
-		Block* frontBlock_ = frontBlock.load();
-		size_t blockTail = frontBlock_->localTail;
-		size_t blockFront = frontBlock_->front.load();
-		
-		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
-			fence(memory_order_acquire);
-			
-		non_empty_front_block:
+
+		Block* frontBlock_;
+		size_t frontIndex;
+		auto loc = locate_front(frontBlock_, frontIndex);
+		if (loc == Empty) {
+			return false;
+		}
+
+		size_t blockFront;
+		if (loc == FoundInCurrentBlock) {
 			// Front block not empty, dequeue from here
+			// (fence(memory_order_acquire) already issued by locate_front)
+			blockFront = frontIndex;
+
 			auto element = reinterpret_cast<T*>(frontBlock_->data + blockFront * sizeof(T));
 			result = std::move(*element);
 			element->~T();
@@ -352,53 +356,19 @@ public:
 			fence(memory_order_release);
 			frontBlock_->front = blockFront;
 		}
-		else if (frontBlock_ != tailBlock.load()) {
-			fence(memory_order_acquire);
-
-			frontBlock_ = frontBlock.load();
-			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
-			blockFront = frontBlock_->front.load();
-			fence(memory_order_acquire);
-			
-			if (blockFront != blockTail) {
-				// Oh look, the front block isn't empty after all
-				goto non_empty_front_block;
-			}
-			
+		else {
 			// Front block is empty but there's another block ahead, advance to it
-			Block* nextBlock = frontBlock_->next;
-			// Don't need an acquire fence here since next can only ever be set on the tailBlock,
-			// and we're not the tailBlock, and we did an acquire earlier after reading tailBlock which
-			// ensures next is up-to-date on this CPU in case we recently were at tailBlock.
-
-			size_t nextBlockFront = nextBlock->front.load();
-			size_t nextBlockTail = nextBlock->localTail = nextBlock->tail.load();
-			fence(memory_order_acquire);
-
-			// Since the tailBlock is only ever advanced after being written to,
-			// we know there's for sure an element to dequeue on it
-			assert(nextBlockFront != nextBlockTail);
-			AE_UNUSED(nextBlockTail);
-
-			// We're done with this block, let the producer use it if it needs
-			fence(memory_order_release);		// Expose possibly pending changes to frontBlock->front from last dequeue
-			frontBlock = frontBlock_ = nextBlock;
-
-			compiler_fence(memory_order_release);	// Not strictly needed
+			// (next block acquire/read/release/compiler_fence all inside advance_front)
+			size_t nextBlockFront = advance_front(frontBlock_);
 
 			auto element = reinterpret_cast<T*>(frontBlock_->data + nextBlockFront * sizeof(T));
-			
 			result = std::move(*element);
 			element->~T();
 
 			nextBlockFront = (nextBlockFront + 1) & frontBlock_->sizeMask;
-			
+
 			fence(memory_order_release);
 			frontBlock_->front = nextBlockFront;
-		}
-		else {
-			// No elements in current block and no other block to advance to
-			return false;
 		}
 
 		return true;
@@ -417,36 +387,26 @@ public:
 #endif
 		// See try_dequeue() for reasoning
 
-		Block* frontBlock_ = frontBlock.load();
-		size_t blockTail = frontBlock_->localTail;
-		size_t blockFront = frontBlock_->front.load();
-		
-		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
-			fence(memory_order_acquire);
-		non_empty_front_block:
-			return reinterpret_cast<T*>(frontBlock_->data + blockFront * sizeof(T));
+		Block* frontBlock_;
+		size_t frontIndex;
+		auto loc = locate_front(frontBlock_, frontIndex);
+		if (loc == Empty) {
+			return nullptr;
 		}
-		else if (frontBlock_ != tailBlock.load()) {
-			fence(memory_order_acquire);
-			frontBlock_ = frontBlock.load();
-			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
-			blockFront = frontBlock_->front.load();
-			fence(memory_order_acquire);
-			
-			if (blockFront != blockTail) {
-				goto non_empty_front_block;
-			}
-			
-			Block* nextBlock = frontBlock_->next;
-			
-			size_t nextBlockFront = nextBlock->front.load();
-			fence(memory_order_acquire);
 
-			assert(nextBlockFront != nextBlock->tail.load());
-			return reinterpret_cast<T*>(nextBlock->data + nextBlockFront * sizeof(T));
+		if (loc == FoundInCurrentBlock) {
+			// (fence(memory_order_acquire) already issued by locate_front)
+			return reinterpret_cast<T*>(frontBlock_->data + frontIndex * sizeof(T));
 		}
-		
-		return nullptr;
+
+		// loc == NeedAdvance: peek doesn't modify queue, just read next block's element
+		Block* nextBlock = frontBlock_->next;
+
+		size_t nextBlockFront = nextBlock->front.load();
+		fence(memory_order_acquire);
+
+		assert(nextBlockFront != nextBlock->tail.load());
+		return reinterpret_cast<T*>(nextBlock->data + nextBlockFront * sizeof(T));
 	}
 	
 	// Removes the front element from the queue, if any, without returning it.
@@ -458,15 +418,19 @@ public:
 		ReentrantGuard guard(this->dequeuing);
 #endif
 		// See try_dequeue() for reasoning
-		
-		Block* frontBlock_ = frontBlock.load();
-		size_t blockTail = frontBlock_->localTail;
-		size_t blockFront = frontBlock_->front.load();
-		
-		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
-			fence(memory_order_acquire);
-			
-		non_empty_front_block:
+
+		Block* frontBlock_;
+		size_t frontIndex;
+		auto loc = locate_front(frontBlock_, frontIndex);
+		if (loc == Empty) {
+			return false;
+		}
+
+		size_t blockFront;
+		if (loc == FoundInCurrentBlock) {
+			// (fence(memory_order_acquire) already issued by locate_front)
+			blockFront = frontIndex;
+
 			auto element = reinterpret_cast<T*>(frontBlock_->data + blockFront * sizeof(T));
 			element->~T();
 
@@ -475,43 +439,18 @@ public:
 			fence(memory_order_release);
 			frontBlock_->front = blockFront;
 		}
-		else if (frontBlock_ != tailBlock.load()) {
-			fence(memory_order_acquire);
-			frontBlock_ = frontBlock.load();
-			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
-			blockFront = frontBlock_->front.load();
-			fence(memory_order_acquire);
-			
-			if (blockFront != blockTail) {
-				goto non_empty_front_block;
-			}
-			
+		else {
 			// Front block is empty but there's another block ahead, advance to it
-			Block* nextBlock = frontBlock_->next;
-			
-			size_t nextBlockFront = nextBlock->front.load();
-			size_t nextBlockTail = nextBlock->localTail = nextBlock->tail.load();
-			fence(memory_order_acquire);
-
-			assert(nextBlockFront != nextBlockTail);
-			AE_UNUSED(nextBlockTail);
-
-			fence(memory_order_release);
-			frontBlock = frontBlock_ = nextBlock;
-
-			compiler_fence(memory_order_release);
+			// (next block acquire/read/release/compiler_fence all inside advance_front)
+			size_t nextBlockFront = advance_front(frontBlock_);
 
 			auto element = reinterpret_cast<T*>(frontBlock_->data + nextBlockFront * sizeof(T));
 			element->~T();
 
 			nextBlockFront = (nextBlockFront + 1) & frontBlock_->sizeMask;
-			
+
 			fence(memory_order_release);
 			frontBlock_->front = nextBlockFront;
-		}
-		else {
-			// No elements in current block and no other block to advance to
-			return false;
 		}
 
 		return true;
@@ -801,6 +740,70 @@ private:
 	}
 
 private:
+	enum LocateResult { Empty, FoundInCurrentBlock, NeedAdvance };
+
+	// Performs the double-check empty pattern. Returns:
+	//   Empty: queue is empty
+	//   FoundInCurrentBlock: element found in current block, outFrontBlock/outFront set
+	//   NeedAdvance: current block is empty, next block exists, outFrontBlock set
+	LocateResult locate_front(Block*& outFrontBlock, size_t& outFront) const AE_NO_TSAN
+	{
+		Block* frontBlock_ = frontBlock.load();
+		size_t blockTail = frontBlock_->localTail;
+		size_t blockFront = frontBlock_->front.load();
+
+		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
+			fence(memory_order_acquire);
+			outFrontBlock = frontBlock_;
+			outFront = blockFront;
+			return FoundInCurrentBlock;
+		}
+		else if (frontBlock_ != tailBlock.load()) {
+			fence(memory_order_acquire);
+
+			frontBlock_ = frontBlock.load();
+			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
+			blockFront = frontBlock_->front.load();
+			fence(memory_order_acquire);
+
+			if (blockFront != blockTail) {
+				outFrontBlock = frontBlock_;
+				outFront = blockFront;
+				return FoundInCurrentBlock;
+			}
+
+			outFrontBlock = frontBlock_;
+			return NeedAdvance;
+		}
+		else {
+			return Empty;
+		}
+	}
+
+	// Advances frontBlock to nextBlock. Caller must have frontBlock_ from locate_front(NeedAdvance).
+	// Publishes the previous front block's final front to producer, then upgrades frontBlock.
+	// Returns the front index of the element in the new block, sets outFrontBlock to the new frontBlock.
+	size_t advance_front(Block*& outFrontBlock) AE_NO_TSAN
+	{
+		Block* frontBlock_ = outFrontBlock;
+		Block* nextBlock = frontBlock_->next;
+
+		size_t nextBlockFront = nextBlock->front.load();
+		size_t nextBlockTail = nextBlock->localTail = nextBlock->tail.load();
+		fence(memory_order_acquire);
+
+		assert(nextBlockFront != nextBlockTail);
+		AE_UNUSED(nextBlockTail);
+
+		fence(memory_order_release);
+		frontBlock = frontBlock_ = nextBlock;
+
+		compiler_fence(memory_order_release);
+
+		outFrontBlock = frontBlock_;
+		return nextBlockFront;
+	}
+
 	weak_atomic<Block*> frontBlock;		// (Atomic) Elements are dequeued from this block
 	
 	char cachelineFiller[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(weak_atomic<Block*>)];
