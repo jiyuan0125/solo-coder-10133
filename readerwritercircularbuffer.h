@@ -24,23 +24,6 @@
 
 namespace moodycamel {
 
-namespace details {
-	AE_FORCEINLINE static std::size_t ceilToPow2(std::size_t x)
-	{
-		if (x <= 1) {
-			return 1;
-		}
-		--x;
-		x |= x >> 1;
-		x |= x >> 2;
-		x |= x >> 4;
-		for (std::size_t i = 1; i < sizeof(std::size_t); i <<= 1)
-			x |= x >> (i << 3);
-		++x;
-		return x;
-	}
-}
-
 template<typename T>
 class BlockingReaderWriterCircularBuffer
 {

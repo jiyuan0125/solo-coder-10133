@@ -120,12 +120,12 @@ public:
 		,dequeuing(false)
 #endif
 	{
-		assert(MAX_BLOCK_SIZE == ceilToPow2(MAX_BLOCK_SIZE) && "MAX_BLOCK_SIZE must be a power of 2");
+		assert(MAX_BLOCK_SIZE == details::ceilToPow2(MAX_BLOCK_SIZE) && "MAX_BLOCK_SIZE must be a power of 2");
 		assert(MAX_BLOCK_SIZE >= 2 && "MAX_BLOCK_SIZE must be at least 2");
 		
 		Block* firstBlock = nullptr;
 		
-		largestBlockSize = ceilToPow2(size + 1);		// We need a spare slot to fit size elements in the block
+		largestBlockSize = details::ceilToPow2(size + 1);		// We need a spare slot to fit size elements in the block
 		if (largestBlockSize > MAX_BLOCK_SIZE * 2) {
 			// We need a spare block in case the producer is writing to a different block the consumer is reading from, and
 			// wants to enqueue the maximum number of elements. We also need a spare element in each block to avoid the ambiguity
@@ -647,23 +647,6 @@ private:
 	ReaderWriterQueue& operator=(ReaderWriterQueue const&) {  }
 
 
-	AE_FORCEINLINE static size_t ceilToPow2(size_t x)
-	{
-		if (x <= 1) {
-			return 1;
-		}
-		// From http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
-		--x;
-		x |= x >> 1;
-		x |= x >> 2;
-		x |= x >> 4;
-		for (size_t i = 1; i < sizeof(size_t); i <<= 1) {
-			x |= x >> (i << 3);
-		}
-		++x;
-		return x;
-	}
-	
 	template<typename U>
 	static AE_FORCEINLINE char* align_for(char* ptr) AE_NO_TSAN
 	{
