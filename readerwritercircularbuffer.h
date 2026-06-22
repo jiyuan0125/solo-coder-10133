@@ -41,7 +41,7 @@ public:
 		// capacity-1 underflow. The public API (max_capacity, try_enqueue, etc.)
 		// still respects the user-provided capacity value.
 		std::size_t internalCapacity = capacity == 0 ? 1 : capacity;
-		std::size_t alignedCapacity = details::ceilToPow2(internalCapacity);
+		std::size_t alignedCapacity = moodycamel::details::ceilToPow2(internalCapacity);
 		mask = alignedCapacity - 1;
 		rawData = static_cast<char*>(std::malloc(alignedCapacity * sizeof(T) + std::alignment_of<T>::value - 1));
 		data = align_for<T>(rawData);

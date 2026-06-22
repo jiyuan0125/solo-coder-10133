@@ -120,12 +120,12 @@ public:
 		,dequeuing(false)
 #endif
 	{
-		assert(MAX_BLOCK_SIZE == details::ceilToPow2(MAX_BLOCK_SIZE) && "MAX_BLOCK_SIZE must be a power of 2");
+		assert(MAX_BLOCK_SIZE == moodycamel::details::ceilToPow2(MAX_BLOCK_SIZE) && "MAX_BLOCK_SIZE must be a power of 2");
 		assert(MAX_BLOCK_SIZE >= 2 && "MAX_BLOCK_SIZE must be at least 2");
 		
 		Block* firstBlock = nullptr;
 		
-		largestBlockSize = details::ceilToPow2(size + 1);		// We need a spare slot to fit size elements in the block
+		largestBlockSize = moodycamel::details::ceilToPow2(size + 1);		// We need a spare slot to fit size elements in the block
 		if (largestBlockSize > MAX_BLOCK_SIZE * 2) {
 			// We need a spare block in case the producer is writing to a different block the consumer is reading from, and
 			// wants to enqueue the maximum number of elements. We also need a spare element in each block to avoid the ambiguity
