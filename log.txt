@@ -16,3 +16,13 @@ Test #4
 Test #5
   ... iteration 0
   ... iteration 16777216
+Test #6
+  ... iteration 0
+  ... iteration 16777216
+Test #7
+  ... iteration 0
+  ... iteration 16777216
+Test #8
+  ... iteration 0
+  ... iteration 16777216
+Test #9
