@@ -102,6 +102,16 @@ public:
 	// allocations. If more than MAX_BLOCK_SIZE elements are requested,
 	// then several blocks of MAX_BLOCK_SIZE each are reserved (including
 	// at least one extra buffer block).
+	//
+	// NOTE ON BLOCK SIZE BEHAVIOR:
+	// - The actual block size used is determined by `ceilToPow2(size + 1)`.
+	// - If the requested size exceeds `MAX_BLOCK_SIZE * 2 - 3` (i.e., more than
+	//   MAX_BLOCK_SIZE * 2 - 1 elements after rounding), then `largestBlockSize`
+	//   is CLAMPED to `MAX_BLOCK_SIZE` and will NOT grow beyond this limit.
+	// - Subsequent block allocations (when enqueueing beyond the initial
+	//   capacity) will use `largestBlockSize`, which is capped at `MAX_BLOCK_SIZE`.
+	// - This means passing very large `size` values will NOT result in larger
+	//   blocks; instead, more blocks of `MAX_BLOCK_SIZE` will be allocated.
 	AE_NO_TSAN explicit ReaderWriterQueue(size_t size = 15)
 #ifndef NDEBUG
 		: enqueuing(false)
@@ -256,6 +266,19 @@ public:
 	// Enqueues a copy of element on the queue.
 	// Allocates an additional block of memory if needed.
 	// Only fails (returns false) if memory allocation fails.
+	//
+	// EXCEPTION SAFETY:
+	// - If T's copy/move constructor throws during emplace/enqueue (CanAlloc path),
+	//   the queue remains in a consistent state: no "half-constructed" element is
+	//   visible via size_approx(), and no slot is permanently occupied.
+	// - If a new block was needed and allocated before the exception, it is safely
+	//   linked into the block list as an empty block (no memory leak) and will be
+	//   reused by subsequent enqueue operations.
+	// - Note: largestBlockSize is only updated after successful construction, so
+	//   an exception during construction will not affect future block sizes.
+	// - In the BlockingReaderWriterQueue wrapper, if the inner enqueue throws,
+	//   the semaphore is NOT signaled, maintaining consistency between the
+	//   semaphore count and the actual element count.
 	AE_FORCEINLINE bool enqueue(T const& element) AE_NO_TSAN
 	{
 		return inner_enqueue<CanAlloc>(element);
@@ -271,6 +294,19 @@ public:
 
 #if MOODYCAMEL_HAS_EMPLACE
 	// Like enqueue() but with emplace semantics (i.e. construct-in-place).
+	//
+	// EXCEPTION SAFETY:
+	// - If T's constructor throws during emplace (CanAlloc path),
+	//   the queue remains in a consistent state: no "half-constructed" element is
+	//   visible via size_approx(), and no slot is permanently occupied.
+	// - If a new block was needed and allocated before the exception, it is safely
+	//   linked into the block list as an empty block (no memory leak) and will be
+	//   reused by subsequent enqueue operations.
+	// - Note: largestBlockSize is only updated after successful construction, so
+	//   an exception during construction will not affect future block sizes.
+	// - In the BlockingReaderWriterQueue wrapper, if the inner emplace throws,
+	//   the semaphore is NOT signaled, maintaining consistency between the
+	//   semaphore count and the actual element count.
 	template<typename... Args>
 	AE_FORCEINLINE bool emplace(Args&&... args) AE_NO_TSAN
 	{
@@ -514,6 +550,16 @@ public:
 	//       the block the consumer is removing from until it's completely empty, except in
 	//       the case where the producer was writing to the same block the consumer was
 	//       reading from the whole time.
+	//
+	// NOTE ON BLOCK SIZE LIMIT:
+	// - `max_capacity` reflects the sum of `sizeMask` (usable slots) across all
+	//   currently allocated blocks.
+	// - Individual block sizes are capped at `MAX_BLOCK_SIZE` (the template parameter).
+	//   If the initial `size` argument to the constructor exceeded `MAX_BLOCK_SIZE * 2 - 3`,
+	//   all blocks will be exactly `MAX_BLOCK_SIZE` in size, and `largestBlockSize`
+	//   will remain clamped at `MAX_BLOCK_SIZE` for the lifetime of the queue.
+	// - Dynamic growth (via `enqueue`/`emplace` allocating new blocks) will only ever
+	//   add blocks of size `largestBlockSize`, which cannot exceed `MAX_BLOCK_SIZE`.
 	inline size_t max_capacity() const {
 		size_t result = 0;
 		Block* frontBlock_ = frontBlock.load();
@@ -595,6 +641,7 @@ private:
 				new (location) T(std::forward<U>(element));
 #endif
 
+				fence(memory_order_release);
 				tailBlockNext->tail = (nextBlockTail + 1) & tailBlockNext->sizeMask;
 
 				fence(memory_order_release);
@@ -608,7 +655,11 @@ private:
 					// Could not allocate a block!
 					return false;
 				}
-				largestBlockSize = newBlockSize;
+
+				// First link the new block into the list to avoid leaking on exception.
+				// The block is empty (tail == front == 0) so consumer will skip it.
+				newBlock->next = tailBlock_->next.load();
+				tailBlock_->next = newBlock;
 
 #if MOODYCAMEL_HAS_EMPLACE
 				new (newBlock->data) T(std::forward<Args>(args)...);
@@ -616,10 +667,12 @@ private:
 				new (newBlock->data) T(std::forward<U>(element));
 #endif
 				assert(newBlock->front == 0);
-				newBlock->tail = newBlock->localTail = 1;
 
-				newBlock->next = tailBlock_->next.load();
-				tailBlock_->next = newBlock;
+				// Only update state after successful construction
+				largestBlockSize = newBlockSize;
+
+				fence(memory_order_release);
+				newBlock->tail = newBlock->localTail = 1;
 
 				// Might be possible for the dequeue thread to see the new tailBlock->next
 				// *without* seeing the new tailBlock value, but this is OK since it can't
@@ -653,16 +706,7 @@ private:
 
 	AE_FORCEINLINE static size_t ceilToPow2(size_t x)
 	{
-		// From http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
-		--x;
-		x |= x >> 1;
-		x |= x >> 2;
-		x |= x >> 4;
-		for (size_t i = 1; i < sizeof(size_t); i <<= 1) {
-			x |= x >> (i << 3);
-		}
-		++x;
-		return x;
+		return ::moodycamel::detail::ceilToPow2(x);
 	}
 	
 	template<typename U>
@@ -946,7 +990,7 @@ public:
 	// Safe to call from both the producer and consumer threads.
 	AE_FORCEINLINE size_t size_approx() const AE_NO_TSAN
 	{
-		return sema->availableApprox();
+		return inner.size_approx();
 	}
 
 	// Returns the total number of items that could be enqueued without incurring

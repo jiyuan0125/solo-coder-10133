@@ -37,16 +37,10 @@ public:
 		items(new spsc_sema::LightweightSemaphore(0)),
 		nextSlot(0), nextItem(0)
 	{
-		// Round capacity up to power of two to compute modulo mask.
-		// Adapted from http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
-		--capacity;
-		capacity |= capacity >> 1;
-		capacity |= capacity >> 2;
-		capacity |= capacity >> 4;
-		for (std::size_t i = 1; i < sizeof(std::size_t); i <<= 1)
-			capacity |= capacity >> (i << 3);
-		mask = capacity++;
-		rawData = static_cast<char*>(std::malloc(capacity * sizeof(T) + std::alignment_of<T>::value - 1));
+		std::size_t actualCapacity = capacity == 0 ? 1 : capacity;
+		std::size_t alignedCapacity = ::moodycamel::detail::ceilToPow2(actualCapacity);
+		mask = alignedCapacity - 1;
+		rawData = static_cast<char*>(std::malloc(alignedCapacity * sizeof(T) + std::alignment_of<T>::value - 1));
 		data = align_for<T>(rawData);
 	}
 
@@ -65,7 +59,8 @@ public:
 	// being deleted. It's up to the user to synchronize this.
 	~BlockingReaderWriterCircularBuffer()
 	{
-		for (std::size_t i = 0, n = items->availableApprox(); i != n; ++i)
+		std::size_t count = nextSlot - nextItem;
+		for (std::size_t i = 0; i != count; ++i)
 			reinterpret_cast<T*>(data)[(nextItem + i) & mask].~T();
 		std::free(rawData);
 	}
@@ -95,7 +90,20 @@ public:
 	// Enqueues a single item (by copying it).
 	// Fails if not enough room to enqueue.
 	// Thread-safe when called by producer thread.
-	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	//
+	// EXCEPTION SAFETY:
+	// - If T's copy/move constructor throws during enqueue, the queue remains
+	//   in a consistent state: the slot reservation (via slots_->tryWait) is
+	//   NOT rolled back (one slot is effectively lost), but size_approx() will
+	//   NOT report a phantom element (nextSlot is only incremented after
+	//   successful construction with a release fence).
+	// - This means a throwing constructor will permanently reduce the available
+	//   capacity by 1 until the queue is destroyed. This is a deliberate tradeoff
+	//   to avoid the complexity of rolling back the semaphore state while maintaining
+	//   strict SPSC memory ordering.
+	// - If you need strong exception safety for throwing constructors, use
+	//   ReaderWriterQueue/BlockingReaderWriterQueue instead, which can recover
+	//   from constructor exceptions without losing capacity.
 	bool try_enqueue(T const& item)
 	{
 		if (!slots_->tryWait())
@@ -191,6 +199,9 @@ public:
 	template<typename U>
 	bool try_dequeue(U& item)
 	{
+		fence(memory_order_acquire);
+		if (nextSlot == nextItem)
+			return false;
 		if (!items->tryWait())
 			return false;
 		inner_dequeue(item);
@@ -203,7 +214,19 @@ public:
 	template<typename U>
 	void wait_dequeue(U& item)
 	{
-		while (!items->wait());
+		while (true) {
+			fence(memory_order_acquire);
+			if (nextSlot != nextItem && items->tryWait())
+				break;
+			if (!items->wait())
+				continue;
+			fence(memory_order_acquire);
+			if (nextSlot != nextItem) {
+				inner_dequeue(item);
+				return;
+			}
+			items->signal();
+		}
 		inner_dequeue(item);
 	}
 
@@ -215,10 +238,27 @@ public:
 	template<typename U>
 	bool wait_dequeue_timed(U& item, std::int64_t timeout_usecs)
 	{
-		if (!items->wait(timeout_usecs))
-			return false;
-		inner_dequeue(item);
-		return true;
+		auto start = std::chrono::steady_clock::now();
+		while (true) {
+			fence(memory_order_acquire);
+			if (nextSlot != nextItem && items->tryWait()) {
+				inner_dequeue(item);
+				return true;
+			}
+			auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - start).count();
+			auto remaining = timeout_usecs - elapsed;
+			if (remaining <= 0)
+				return false;
+			if (!items->wait(remaining))
+				return false;
+			fence(memory_order_acquire);
+			if (nextSlot != nextItem) {
+				inner_dequeue(item);
+				return true;
+			}
+			items->signal();
+		}
 	}
 
 	// Blocks the current thread until either there's something to dequeue
@@ -238,7 +278,8 @@ public:
 	// Thread-safe when called by consumer thread.
 	inline T* peek()
 	{
-		if (!items->availableApprox())
+		fence(memory_order_acquire);
+		if (nextSlot == nextItem)
 			return nullptr;
 		return inner_peek();
 	}
@@ -247,6 +288,9 @@ public:
 	// Thread-safe when called by consumer thread.
 	inline bool try_pop()
 	{
+		fence(memory_order_acquire);
+		if (nextSlot == nextItem)
+			return false;
 		if (!items->tryWait())
 			return false;
 		inner_pop();
@@ -257,7 +301,8 @@ public:
 	// Thread-safe.
 	inline std::size_t size_approx() const
 	{
-		return items->availableApprox();
+		fence(memory_order_acquire);
+		return nextSlot - nextItem;
 	}
 
 	// Returns the maximum number of elements that this circular buffer can hold at once.
@@ -271,9 +316,11 @@ private:
 	template<typename U>
 	void inner_enqueue(U&& item)
 	{
-		std::size_t i = nextSlot++;
+		std::size_t i = nextSlot;
 		new (reinterpret_cast<T*>(data) + (i & mask)) T(std::forward<U>(item));
+		fence(memory_order_release);
 		items->signal();
+		nextSlot = i + 1;
 	}
 
 	template<typename U>

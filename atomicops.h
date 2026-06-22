@@ -103,6 +103,24 @@ extern "C" void AnnotateHappensAfter(const char*, int, void*);
 
 namespace moodycamel {
 
+namespace detail {
+AE_FORCEINLINE size_t ceilToPow2(size_t x)
+{
+	if (x == 0) {
+		return 1;
+	}
+	--x;
+	x |= x >> 1;
+	x |= x >> 2;
+	x |= x >> 4;
+	for (size_t i = 1; i < sizeof(size_t); i <<= 1) {
+		x |= x >> (i << 3);
+	}
+	++x;
+	return x;
+}
+} // namespace detail
+
 enum memory_order {
 	memory_order_relaxed,
 	memory_order_acquire,
